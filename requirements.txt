@@ -1,2 +1,11 @@
 streamlit
 pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+nltk
+keybert
+transformers
+torch
+sentence-transformers

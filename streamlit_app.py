@@ -1,151 +1,247 @@
+# streamlit_app.py
 import streamlit as st
 import pandas as pd
-import math
-from pathlib import Path
+import numpy as np
+import re
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import NMF, PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from keybert import KeyBERT
+from transformers import pipeline
+import nltk
+nltk.download('vader_lexicon')
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+#
+# Functions
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
-
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
-
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+def clean_text(df, text_column='employee_feedback'):
+    df['clean_text'] = (
+        df[text_column].astype(str)
+        .str.lower()
+        .str.replace(r'[^\w\s]', '', regex=True)
+        .str.strip()
     )
+    return df
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+def fit_nmf_model(df, text_column='clean_text', n_topics=10):
+    vectorizer = TfidfVectorizer(max_features=5000, stop_words='english')
+    X = vectorizer.fit_transform(df[text_column])
+    nmf_model = NMF(n_components=n_topics, random_state=42)
+    W = nmf_model.fit_transform(X)
+    H = nmf_model.components_
+    feature_names = vectorizer.get_feature_names_out()
+    return nmf_model, W, H, feature_names
 
-    return gdp_df
+def assign_topics(df, W):
+    df['topic'] = W.argmax(axis=1)
+    return df
 
-gdp_df = get_gdp_data()
+def get_topic_words(H, feature_names, n_words=10):
+    topic_words = {}
+    for i, topic in enumerate(H):
+        top_words = [feature_names[j] for j in topic.argsort()[-n_words:][::-1]]
+        topic_words[i] = top_words
+    return topic_words
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+def generate_topic_labels(topic_words):
+    kw_model = KeyBERT(model='all-MiniLM-L6-v2')
+    topic_labels = {}
+    for t, words in topic_words.items():
+        topic_text = " ".join(words)
+        keywords = kw_model.extract_keywords(topic_text, keyphrase_ngram_range=(1,2), stop_words='english', top_n=1)
+        label = keywords[0][0] if keywords else f"Topic {t}"
+        topic_labels[t] = label
+    return topic_labels
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+def employee_sentiment(df, text_column='clean_text'):
+    sia = SentimentIntensityAnalyzer()
+    df['sentiment_score'] = df[text_column].apply(lambda x: sia.polarity_scores(str(x))['compound'])
+    df['sentiment_label'] = df['sentiment_score'].apply(
+        lambda x: "Positive" if x >= 0.05 else ("Negative" if x <= -0.05 else "Neutral")
+    )
+    return df
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+def department_topic_summary(df):
+    summary = df.groupby(['department','topic']).size().reset_index(name='count')
+    return summary
 
-# Add some spacing
-''
-''
+def plot_department_topics_with_labels(df, topic_label_col='topic_label'):
+    """
+    Plot department-wise topic distribution with topic labels on each bar.
+    """
+    summary = df.groupby(['department', topic_label_col]).size().reset_index(name='count')
+    
+    plt.figure(figsize=(12,6))
+    ax = sns.barplot(
+        data=summary,
+        x='department',
+        y='count',
+        hue=topic_label_col
+    )
+    
+    # Add labels on top of each bar
+    for p in ax.patches:
+        height = p.get_height()
+        if height > 0:
+            ax.annotate(
+                f'{p.get_height():.0f}',
+                (p.get_x() + p.get_width() / 2., height),
+                ha='center',
+                va='bottom',
+                fontsize=9,
+                rotation=0
+            )
+    
+    plt.title("Department-wise Topic Distribution with Labels")
+    plt.ylabel("Number of Employees")
+    plt.xlabel("Department")
+    plt.xticks(rotation=45)
+    plt.legend(title="Topic", bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    st.pyplot(plt.gcf())
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+def cluster_employee_profiles(df, W, n_clusters=5):
+    features = np.hstack([W, df['sentiment_score'].values.reshape(-1,1)])
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    df['employee_profile'] = kmeans.fit_predict(features_scaled)
+    return df, kmeans
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
+def list_employees_by_cluster_with_topic_and_sentiment(
+    df, 
+    cluster_col='employee_profile', 
+    id_col='unique_identifier', 
+    dept_col='department', 
+    feedback_col='employee_feedback', 
+    topic_col='topic', 
+    topic_label_col='topic_label',
+    sentiment_col='sentiment_score',
+    role_col='inferred_role'
+):
+    cluster_dict = {}
+    clusters = df[cluster_col].unique()
+    for c in clusters:
+        cluster_df = df[df[cluster_col] == c].copy()
+        avg_sent = cluster_df[sentiment_col].mean()
+        if avg_sent >= 0.05:
+            sentiment_label = "Mostly Positive"
+        elif avg_sent <= -0.05:
+            sentiment_label = "Mostly Negative"
         else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+            sentiment_label = "Neutral"
+        cluster_name = f"Cluster {c} – {sentiment_label} (avg={avg_sent:.2f})"
+        columns_to_show = [id_col, dept_col, feedback_col, topic_col, topic_label_col, sentiment_col, role_col]
+        cluster_dict[cluster_name] = cluster_df[columns_to_show].reset_index(drop=True)
+    return cluster_dict
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
+def visualize_employee_clusters_3d(df, W, cluster_col='employee_profile', n_components=3):
+    features = np.hstack([W, df['sentiment_score'].values.reshape(-1,1)])
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+    pca = PCA(n_components=n_components, random_state=42)
+    components = pca.fit_transform(features_scaled)
+    fig = plt.figure(figsize=(10,8))
+    ax = fig.add_subplot(111, projection='3d')
+    clusters = df[cluster_col].unique()
+    colors = plt.cm.tab10.colors
+    for i, c in enumerate(clusters):
+        idx = df[cluster_col] == c
+        ax.scatter(
+            components[idx,0], components[idx,1], components[idx,2],
+            c=[colors[i%10]], label=f'Cluster {c}',
+            s=50, alpha=0.7
         )
+    ax.set_xlabel('PC 1')
+    ax.set_ylabel('PC 2')
+    ax.set_zlabel('PC 3')
+    ax.set_title('Employee Clusters by Topic Distribution + Sentiment')
+    ax.legend()
+    st.pyplot(fig)
+
+def infer_roles(df, text_column='employee_feedback'):
+    st.info("Inferring roles...")
+    candidate_roles = [
+        "Entry-level",
+        "Early Career",
+        "Mid-level",
+        "Lower Management",
+        "Upper Management",
+        "Executive / C-suite"
+    ]
+    role_classifier = pipeline(
+        "zero-shot-classification",
+        model="typeform/distilbert-base-uncased-mnli"
+    )
+    df['inferred_role'] = df[text_column].apply(
+        lambda x: "unknown" if not isinstance(x,str) or len(x.strip())==0 else
+                  role_classifier(x, candidate_labels=candidate_roles, multi_label=False)['labels'][0]
+    )
+    return df
+
+def plot_roles_by_department(df):
+    st.subheader("Inferred Roles by Department (Objective 3, can sense check against known distribution but not foolproof)")
+    role_counts = df.groupby(['department','inferred_role']).size().reset_index(name='count')
+    fig, ax = plt.subplots(figsize=(12,6))
+    sns.barplot(data=role_counts, x='department', y='count', hue='inferred_role', ax=ax)
+    plt.xticks(rotation=45)
+    plt.ylabel("Number of Employees")
+    plt.xlabel("Department")
+    plt.title("Role Distribution by Department")
+    plt.legend(title="Role", bbox_to_anchor=(1.05,1), loc='upper left')
+    st.pyplot(fig)
+
+
+# Streamlit App
+
+st.title("Employee Feedback Topic, Sentiment & Role Analyzer")
+
+uploaded_file = st.file_uploader("Upload CSV or Excel file", type=['csv','xls','xlsx'])
+
+if uploaded_file is not None:
+    df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('xls','xlsx')) else pd.read_csv(uploaded_file)
+    st.write("Data Preview:")
+    st.dataframe(df.head())
+
+    df = clean_text(df)
+
+    n_topics = st.slider("Number of Topics", 5, 20, 10)
+    nmf_model, W, H, feature_names = fit_nmf_model(df, n_topics=n_topics)
+    df = assign_topics(df, W)
+    topic_words = get_topic_words(H, feature_names)
+    topic_labels = generate_topic_labels(topic_words)
+    df['topic_label'] = df['topic'].map(topic_labels)
+
+
+    df = employee_sentiment(df)
+
+    st.subheader("Topic Summary (Objective 1)")
+    sia = SentimentIntensityAnalyzer()
+    topic_sentiments = {t: sia.polarity_scores(" ".join(words))['compound'] for t, words in topic_words.items()}
+    topic_summary_df = pd.DataFrame({
+        'topic': list(topic_words.keys()),
+        'top_words': [" ".join(w) for w in topic_words.values()],
+        'label': [topic_labels[t] for t in topic_words.keys()],
+        'sentiment': [("Positive" if topic_sentiments[t]>=0.05 else "Negative" if topic_sentiments[t]<=-0.05 else "Neutral") 
+                      for t in topic_words.keys()]
+    })
+    st.dataframe(topic_summary_df)
+
+
+    st.subheader("Department-wise Topic Distribution (Objective 2)")
+    dept_summary = department_topic_summary(df)
+    plot_department_topics_with_labels(df, topic_label_col='topic_label')
+
+ 
+    df = infer_roles(df)
+    
+
+
+    st.subheader("Employee Feedback with Inferred Roles (Objective 3)")
+    st.dataframe(df[[ 'inferred_role','unique_identifier', 'department', 'employee_feedback']])
+
+    plot_roles_by_department(df)
